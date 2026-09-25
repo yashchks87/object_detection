@@ -1,0 +1,4 @@
+nohup: ignoring input
+2026-09-25 02:35:15,723 INFO MainThread Args: {'src': PosixPath('/local_disk0/train2017'), 'dst': PosixPath('/Volumes/daai_ke_team/default/images/object_detection_datasets/coco/train'), 'workers': 64, 'retries': 4, 'limit': None, 'log_every': 30.0, 'failed_list': PosixPath('copy_failed.txt')}
+2026-09-25 02:35:17,023 INFO MainThread Found 118287 files (19.31 GB) under /local_disk0/train2017 in 1.3s
+2026-09-25 02:35:47,206 INFO MainThread Progress: 175/118287 files (0.1%) | 0.03/19.31 GB | 1.0 MB/s | copied=175 skipped=0 failed=0 | ETA 322.1 min
