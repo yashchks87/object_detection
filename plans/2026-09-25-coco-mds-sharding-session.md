@@ -3,8 +3,9 @@
 Date: 2026-09-25
 Chat transcript (condensed but complete) between Yash and Devin covering the
 design and build of the COCO MDS sharding scripts, the full sharding run and
-its overlapping-runs incident, verification of the final shards, and the
-reconstruction of `create_shards.py` after the repo was re-cloned.
+its overlapping-runs incident, verification of the final shards, the
+reconstruction of `create_shards.py` after the repo was re-cloned, and why
+`--terminate-cluster` appeared not to turn the cluster off.
 
 ---
 
@@ -221,6 +222,91 @@ hash-checked and skipped, and the train index + `dataset_meta.json` are
 rebuilt. Caveat: a `--splits train` run rewrites `dataset_meta.json` with only
 the train split count.
 
+(Done: the fixes and this plan document were committed and pushed as
+`d084459`.)
+
+## 7. `--terminate-cluster` works, but the cluster comes straight back
+
+**Symptom:** when a job finishes with `--terminate-cluster`, the SSH session
+drops, but the Databricks UI shows the cluster still running.
+
+**Diagnosis** (cluster event log via `GET /api/2.1/clusters/get` +
+`POST /api/2.1/clusters/events`, read-only):
+
+| Time (UTC) | Event |
+|---|---|
+| 18:29:13 | Sharding finishes (`dataset_meta.json` written) |
+| 18:29:15 | **TERMINATING**, reason `USER_REQUEST` - the script's terminate call succeeded |
+| 18:29:25 | **STARTING**, by `yash.choksi@intusurg.com`, 10 seconds later |
+| 18:30:38 | RUNNING again (machine uptime starts 18:29:35) |
+
+- The code did its job; only ~10 s of shutdown was billed, not idle time.
+- **Cause:** the connection goes through the Databricks SSH tunnel
+  (`databricks ssh`), whose `--auto-start-cluster` option defaults to `true`.
+  Terminating drops the IDE's remote SSH connection, the IDE auto-reconnects,
+  and the reconnect starts the cluster again under the user's identity.
+- Contrast: the 04:16 terminate earlier that day stayed off until a manual
+  start at 16:37 - nothing was connected to reconnect.
+- Code running on the cluster cannot prevent this (once terminated, nothing
+  runs); the fix is on the laptop side.
+
+| Situation | Result |
+|---|---|
+| IDE remote window open when job finishes | terminates, restarts ~10 s later |
+| IDE window closed / laptop asleep or offline | stays off |
+| `--auto-start-cluster=false` on the laptop | stays off even with the IDE open (IDE shows a connection error) |
+
+**Side effect that explains section 4:** a restart is a fresh machine -
+`/root` and `/local_disk0` are wiped. That is why the repo had to be re-cloned
+at 18:35 and the fixed scripts + `scripts/logs/` were gone. Only the Volume and
+git survive; always commit/push before a terminating run.
+
+### Two options (recommended: option 1)
+
+1. **Turn off auto-start** (set once, works even if the IDE is left open;
+   cluster must then be started from the UI before connecting).
+2. **Close the IDE SSH window** before a `--terminate-cluster` job finishes
+   (no setup, but must be remembered every time).
+
+Safety net (not a third way to stop the restart): set cluster
+auto-termination, e.g. 60 min (currently `autotermination_minutes: 0` =
+never). After the SSH client disconnects, the SSH server waits its
+`shutdown-delay` (default 10 min), then the idle timeout applies.
+
+### How to turn off auto-start (on the laptop, not the cluster)
+
+Step 1 - find the host name in the SSH config:
+
+```bash
+# Mac/Linux
+grep -A6 -i "databricks" ~/.ssh/config
+# Windows (PowerShell), file is C:\Users\<you>\.ssh\config
+Select-String -Path $HOME\.ssh\config -Pattern databricks -Context 0,6
+```
+
+Look for a block whose `ProxyCommand` runs `databricks ssh connect ...` with
+cluster `0617-134451-zyc049aq`; the name after `Host` is the host name.
+
+Step 2 - either re-run setup:
+
+```bash
+databricks ssh setup --name <your-host-name> --cluster 0617-134451-zyc049aq --auto-start-cluster=false
+```
+
+or edit `~/.ssh/config` by hand: add `--auto-start-cluster=false` to that
+host's `ProxyCommand` line (or change `--auto-start-cluster=true` to `false`).
+
+Step 3 - re-run the Step 1 command and confirm `--auto-start-cluster=false` is
+on the `ProxyCommand` line.
+
+From then on: start the cluster in the Databricks UI (Compute -> cluster ->
+Start), wait for **Running**, then connect from the IDE. When a job ends with
+`--terminate-cluster`, the IDE shows a connection error and the cluster stays
+off.
+
+Reference: Databricks docs, "Connect to Databricks using an SSH tunnel" and
+the CLI `ssh` command group (`--auto-start-cluster`, default `true`).
+
 ---
 
 ## State at end of session
@@ -229,6 +315,9 @@ the train split count.
   (train 118,286 / val 5,000 / test 40,670; 161 groups).
 - Scripts: `scripts/create_shards.py`, `scripts/run_sharding.sh`
   (run with `$PYSPARK_PYTHON`, not the repo venv).
+- Cluster `0617-134451-zyc049aq`: before a `--terminate-cluster` run, either
+  set `--auto-start-cluster=false` on the laptop or close the IDE SSH window
+  (section 7).
 
 Reading the shards:
 
