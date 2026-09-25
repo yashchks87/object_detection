@@ -119,7 +119,10 @@ def build_tasks(images_dir: Path, instances: dict) -> list[SampleTask]:
     """One task per annotated image (including images without objects)."""
     anns_by_image: dict[int, list[dict]] = defaultdict(list)
     for ann in instances["annotations"]:
-        anns_by_image[ann["image_id"]].append(ann)
+        image_id = ann.pop("image_id")  # redundant with the record's image_id column
+        anns_by_image[image_id].append(ann)
+    for anns in anns_by_image.values():
+        anns.sort(key=lambda a: a["id"])
     tasks = [
         SampleTask(
             image_id=img["id"],
@@ -171,10 +174,8 @@ def task_to_record(task: SampleTask, cat_to_idx: dict[int, int]) -> dict:
     height = task.height if task.height is not None else h
 
     anns = task.annotations
-    boxes = np.zeros((len(anns), 4), dtype=np.float32)
-    for i, ann in enumerate(anns):
-        x, y, bw, bh = ann["bbox"]
-        boxes[i] = (x, y, x + bw, y + bh)
+    boxes = np.array([a["bbox"] for a in anns], dtype=np.float32).reshape(-1, 4)  # xywh
+    boxes[:, 2:] += boxes[:, :2]  # -> xyxy
     classes = np.array([cat_to_idx[a["category_id"]] for a in anns], dtype=np.int64)
     iscrowd = np.array([a.get("iscrowd", 0) for a in anns], dtype=np.uint8)
 
