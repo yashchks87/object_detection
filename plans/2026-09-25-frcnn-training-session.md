@@ -195,20 +195,185 @@ Yash asked for the command to run himself (no launch by Devin). Nothing was
 launched. Leftovers from the smoke test that can be deleted:
 `/local_disk0/tmp/smoke_runs` and the offline run under `wandb/`.
 
+## 9. Plan docs and experiment note
+
+- This session log was written on request (chat portion only, in `plans/`).
+- `plans/exp001-frcnn-v2-baseline.md`: short note for the first experiment
+  (model/arch table, data, hyperparameters, derived schedule numbers:
+  7,393 steps/epoch, 192,218 total, LR drops at steps 118,288 / 162,646;
+  43.66M params / 43.44M trainable; expectation ~40-42 AP (estimate), ~24 h;
+  empty Results section to fill in).
+- Yash launched `./scripts/run_training.sh frcnn_v2_001` himself (22:09 UTC,
+  2026-09-25, WITHOUT `--terminate-cluster`) and committed/pushed the
+  codebase (`2e2fd55 Added model training phase.`).
+
+## 10. Auto-terminate for a run already started without the flag
+
+**Request:** does the training turn the cluster off at the end? -> No (flag is
+fixed at launch). Killing and relaunching would lose progress, so added
+`scripts/terminate_when_done.sh <run_name>`: a detached watcher that waits for
+the run's torchrun PID to exit, then for run_training.sh's
+"Training exited with status N" line, sleeps a settle period (log copy), and
+calls `terminate_cluster()` ONLY if status 0 AND `_TRAINING_SUCCESS` exists.
+Guards: Databricks env vars set, run actually running (PID cmdline must
+contain `train_frcnn.py`, avoids PID reuse), no duplicate watcher.
+`POLL_SECONDS`/`SETTLE_SECONDS` overridable. Tested against a fake run with a
+stub PYTHON (success -> terminate called; failure -> not called; not running ->
+error). Yash asked whether to kill the current run: no, just start the
+watcher; he did (watcher PID 53108). `AGENTS.md` gained the command.
+Committed by Yash as `eabd340`.
+
+## 11. Why GPU utilization / memory differ between GPUs
+
+Sampled at 0.5 s: each GPU 81-100% util (~92% mean), 140-195 W, throughput
+steady 36-37 img/s, CPU ~90% idle. Explanation given:
+- nvidia-smi util = fraction of time any kernel ran in the sample window.
+- DDP stragglers: every step waits in the gradient all-reduce for the slowest
+  rank; ranks get different image sizes (aspect ratio + random multi-scale)
+  and GT counts. Scaling: 11.1 img/s single GPU -> 36-37 on 4 (~83%), typical
+  on PCIe A10G without NVLink.
+- Short CPU-bound gaps in Faster R-CNN (anchor matching, sampling, NMS).
+- Memory 12-20 GB vs 7 GB benchmark = caching-allocator RESERVED memory
+  (fragmentation from varying shapes) + CUDA context + NCCL buffers; not a
+  leak, not an OOM risk. Real peak = W&B `perf/gpu_mem_peak_gb`.
+- Possible later speedups (not done): bf16 DDP gradient compression hook,
+  remove the per-step host sync.
+
+## 12. Skills: plan-update and setup-env
+
+- `.agents/skills/plan-update/SKILL.md` (Yash's requested path/name): writes or
+  updates a compact session log in `plans/` (verify facts via git/logs, one
+  numbered section per request, final "Current state" section, no secrets,
+  never commit). Frontmatter: `triggers: [user]`, allowed read/grep/glob,
+  `permissions.allow` Write(plans/**), git status/log/diff, ls.
+- Fixes along the way: placeholder was `SKILL.MD` -> renamed to `SKILL.md`
+  (case-sensitive); the template block was fenced as ```markdown, which made
+  the VS Code editor render it as the file's own headings -> changed to a
+  4-backtick `text` fence; folder renamed `update_plans` -> `plan-update`
+  because the slash command comes from the folder name.
+- Not showing in the Skills panel: project skills load only from the
+  workspace root, and the Devin workspace is `/root`, not
+  `/root/object_detection`. Open `/root/object_detection` as the workspace
+  (or ask for a global copy in `~/.config/devin/skills/`). In this session the
+  skill is still registered under its old name `update_plans`, so the
+  invocation was carried out by following the file's instructions manually.
+- `.agents/skills/setup-env/SKILL.md`: runs, in this exact order from
+  `/root`, in one persistent shell, stopping at the first failure:
+  `sudo apt-get update`, `pyenv install 3.12`, `pyenv local 3.12`,
+  `cd object_detection/`, `pip install -r requirements.txt`. If 3.12 is already
+  installed, answer N to pyenv's prompt. Note: step 5 uses the pyenv pip, not
+  `venv/` (the launcher defaults to `venv/bin/python`; pass `PYTHON=...` or add
+  a venv step if needed). Both skills committed by Yash as `7a6bb5f`.
+
+## 13. Incident: frcnn_v2_001 killed at 00:06:43 UTC (2026-09-26)
+
+**Request:** why did the run crash? Not a code, GPU, OOM or data failure.
+
+| Time (UTC) | Event |
+|---|---|
+| 22:09 | run started; epochs 1-2 completed (~53 min each) |
+| 23:48:23 | IDE server: "The client has disconnected" (laptop asleep/network) |
+| 00:00 | epoch 2 done; `last.pt` / `best.pt` published to the Volume |
+| 00:06:43.169 | tunnel stdout: `"No SSH clients for 10m0s, shutting down..."` |
+| 00:06:43 | torchrun "Received 15 death signal"; driver stdout: `Reaped child 49799 with status 15` (supervisor) and `Reaped child 53108 with status 15` (watcher) |
+| 01:59 | Yash reconnected; Databricks started a new tunnel (new notebook process 243968) |
+
+Root cause, from the tunnel bootstrap
+`/Workspace/Users/yash.choksi@intusurg.com/.databricks/ssh-tunnel/0.295.0/<cluster>/ssh-server-bootstrap.py`:
+- The Databricks ssh tunnel runs as a job inside a notebook Python process
+  (`db_ipykernel_launcher`, here PID 4694, child of the driver JVM) that calls
+  `prctl(PR_SET_CHILD_SUBREAPER)`. Anything detached with setsid/nohup/disown is
+  re-parented to THAT process, not to init.
+- When the ssh server exits (10 min without clients), `kill_all_children()`
+  runs `pkill -P <notebook pid>` (SIGTERM) in a ~10 Hz loop until no children
+  remain. It never finishes because interactive IDE shells survive SIGTERM,
+  so the loop is STILL running on 4694 (endless "No child has changed state"
+  in `/databricks/driver/logs/stdout`) and instantly kills any newly adopted
+  orphan (this is also why test orphans died within 0.3 s).
+- It killed the setsid'd supervisor and watcher (direct children), then
+  torchrun once it was re-parented. The Lyft-era rationale for setsid
+  ("new session escapes the teardown") was therefore incomplete.
+- Evidence ruled out: no reboot (uptime), no OOM, no driver restart, same
+  cgroup for all processes, the tunnel job itself kept running after 00:06.
+
+Impact: `last.pt` = end of epoch 2 (step 14,786, `epoch_complete: True`); lost
+~914 batches (~7 min; the mid-epoch checkpoint at step 16,000 was not reached).
+W&B reported "Fatal error while uploading data" at shutdown (last minutes may
+be unsynced; `wandb sync wandb/run-20260925_220913-6k8qpuzy`). The watcher died
+too, so the cluster would never have been stopped.
+
+| Epoch | global step | train loss | val AP | val AP50 |
+|---|---|---|---|---|
+| 1 | 7,393 | 0.794 | 0.197 | 0.383 |
+| 2 | 14,786 | 0.650 | 0.255 | 0.450 |
+
+## 14. Fix: shield-process launcher
+
+- Rejected: `systemd-run` (PID 1 is real systemd 255, units start fine, see
+  GPUs/env/netrc) because processes outside the notebook process tree get
+  **"Operation not permitted" on `/Volumes`** (matches the bootstrap comment
+  about losing wsfs/dbfs access when re-parented to PID 1).
+- Adopted: two-level launch in `run_training.sh` and `terminate_when_done.sh`.
+  1. **Shield:** `nohup env --ignore-signal=TERM,INT setsid --fork <script>`
+     (`DETACHED_SESSION=shield`). This is the process the subreaper adopts. It
+     starts with SIGTERM already ignored, so there is no startup race with the
+     kill loop, and it just waits for its child.
+  2. **Supervisor / watcher:** started by the shield with
+     `env --default-signal=TERM,INT,HUP` (`DETACHED_SESSION=supervisor` or
+     `watcher`), i.e. normal signal handling. It is the shield's child, so
+     `pkill -P` never reaches it, and it stays inside the notebook tree (keeps
+     `/Volumes` access). Stopping is unchanged: `kill $(cat <run>.pid)`.
+  - Scripts now re-exec via an absolute `$SCRIPT` path; pre-flight checks run
+    only when `DETACHED_SESSION` is empty. coreutils 9.4 `env` verified to
+    set/clear the SIGTERM ignore bit.
+- Test against the LIVE kill loop (shells launched under PID 4694):
+  `shield_test` (2 epochs x 150 batches, W&B offline,
+  `RUNS_DIR=/local_disk0/tmp/smoke_runs`, watcher with a stub PYTHON). Chain
+  torchrun -> supervisor -> shield -> 4694; trained normally (~37 img/s),
+  exited 0, `_TRAINING_SUCCESS` written, watcher logged "run succeeded" and
+  called the (stub) terminate. A first attempt failed only because of a bad
+  test argument (`--lr-steps 1` with `--epochs 1`); that run still verified
+  the failure path (supervisor recorded status 1, watcher did NOT terminate).
+- Residual risk (unverified): if the notebook process 4694 itself ever exits,
+  the shield would be re-parented to PID 1 and might lose `/Volumes` access
+  (checkpoint publishing would then fail and be reported at the end).
+
+## 15. Resume
+
+Yash ran `./scripts/run_training.sh frcnn_v2_001 --resume auto --terminate-cluster`
+at 02:39:48 UTC (torchrun PID 306057; chain 306057 -> 305844 -> 305838 ->
+4694). Log: `{"event": "resume", ..., "epoch": 3, "skip_batches": 0,
+"global_step": 14786}`; first steps 14,800 / 14,820 at loss 0.64 (continuous
+with epoch 2's 0.65), ~37 img/s. This is the first real exercise of
+`--resume auto` and it behaved as designed (same W&B run id `6k8qpuzy`).
+
 ---
 
-## Launch command (state at end of session)
+## Current state (end of session, 2026-09-26 ~02:45 UTC)
+
+- **Running:** `frcnn_v2_001` epoch 3/26, resumed from step 14,786; ~24 epochs
+  x ~55 min left (~21-22 h). `--terminate-cluster` is set, so after a
+  successful run the log is copied to the Volume and then the cluster is
+  stopped (not deleted). No separate watcher is needed or running.
+- **Paths:** live log `/local_disk0/run_logs/frcnn_v2_001.log`; outputs
+  `/Volumes/daai_ke_team/default/images/object_detection_datasets/coco/runs/frcnn_v2_001/`;
+  W&B `yashchks87/COCO object detection/frcnn_v2_001` (run id `6k8qpuzy`).
 
 ```bash
-cd /root/object_detection
-source venv/bin/activate
-./scripts/run_training.sh frcnn_v2_001                      # detached; safe to close ssh
-# or, auto-stop the cluster after a successful run:
-./scripts/run_training.sh frcnn_v2_001 --terminate-cluster
+cd /root/object_detection && source venv/bin/activate
+tail -f /local_disk0/run_logs/frcnn_v2_001.log              # monitor
+kill $(cat /local_disk0/run_logs/frcnn_v2_001.pid)          # graceful stop
+./scripts/run_training.sh frcnn_v2_001 --resume auto --terminate-cluster   # resume
+./scripts/terminate_when_done.sh <run_name>                 # auto-stop for a run started without the flag
 ```
 
-Monitor: `tail -f /local_disk0/run_logs/frcnn_v2_001.log` and the W&B run
-`yashchks87/COCO object detection/frcnn_v2_001`.
-Stop: `kill $(cat /local_disk0/run_logs/frcnn_v2_001.pid)`.
-Resume after any interruption: `./scripts/run_training.sh frcnn_v2_001 --resume auto`.
-Outputs: `/Volumes/daai_ke_team/default/images/object_detection_datasets/coco/runs/frcnn_v2_001/`.
+- **Uncommitted:** `scripts/run_training.sh`, `scripts/terminate_when_done.sh`
+  (shield launcher) and this plan update.
+- **Leftovers to delete:** `/local_disk0/tmp/smoke_runs`,
+  `/local_disk0/tmp/stub_python`, offline W&B runs under `wandb/`.
+- **Open items:** `wandb sync wandb/run-20260925_220913-6k8qpuzy` to recover
+  pre-crash minutes; open `/root/object_detection` as the Devin workspace so
+  `/plan-update` and `/setup-env` load; fill in the Results section of
+  `plans/exp001-frcnn-v2-baseline.md` when the run ends; residual risk from
+  section 14 (unverified); the Lyft repo's `run_training.sh` has the same
+  setsid weakness (not changed).

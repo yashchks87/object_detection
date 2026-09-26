@@ -21,12 +21,26 @@
 #   NUM_GPUS   processes per node (default: all visible GPUs)
 #   PYTHON     interpreter (default: <repo>/venv/bin/python)
 #
-# Detach mechanics: the run is re-executed under `nohup setsid --fork`. nohup
-# makes it ignore SIGHUP; setsid puts it in a brand-new session with no
-# controlling terminal, reparented to init. The second part matters on
-# Databricks: the ssh-tunnel serving the IDE terminal SIGTERMs every process
-# in its sshd session when it shuts down ("No SSH clients for 10m0s"), which
-# nohup/disown alone do not survive (this killed a Lyft run in its last epoch).
+# Detach mechanics (shield process). On Databricks the IDE ssh-tunnel runs
+# inside a notebook Python process that (a) is a child SUBREAPER, so anything
+# detached with setsid/nohup/disown is re-parented to IT (not to init), and
+# (b) when the tunnel shuts down ("No SSH clients for 10m0s") runs
+# kill_all_children(): `pkill -P <notebook pid>` (SIGTERM) in a ~10 Hz loop
+# until no children remain -- in practice forever, because interactive shells
+# survive it. That killed frcnn_v2_001 at 00:06:43 on 2026-09-26. Escaping to
+# PID 1 (e.g. systemd-run) is NOT an option: processes outside the notebook
+# process tree get "Operation not permitted" on /Volumes.
+#
+# So the launch is two-level:
+#   shield      `nohup env --ignore-signal=TERM,INT setsid --fork` -> this is
+#               the process the subreaper adopts; it starts with SIGTERM
+#               already ignored (no startup race with the kill loop) and only
+#               waits for its child;
+#   supervisor  started by the shield via `env --default-signal=...`, i.e. with
+#               normal signal handling; it runs torchrun and finalize(). It is
+#               the shield's child, never a direct child of the notebook, so
+#               `pkill -P` never reaches it -- and it keeps /Volumes access.
+# Stopping a run is unchanged: SIGTERM the torchrun PID in <run>.pid.
 #
 # Logging: the live log is written ONLY to node-local disk while training runs
 # (streaming small writes to a /Volumes FUSE mount can wedge the processes in
@@ -69,6 +83,7 @@ for arg in "$@"; do
 done
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT="$REPO_ROOT/scripts/$(basename "${BASH_SOURCE[0]}")"
 PYTHON="${PYTHON:-$REPO_ROOT/venv/bin/python}"
 CACHE_DIR="${CACHE_DIR:-/local_disk0/mds_cache_coco}"
 RUNS_DIR="${RUNS_DIR:-/Volumes/daai_ke_team/default/images/object_detection_datasets/coco/runs}"
@@ -81,7 +96,7 @@ DETACH="${DETACH:-1}"
 # ---------------------------------------------------------------------------
 # Pre-flight checks (only in the submitting process, where errors are visible).
 # ---------------------------------------------------------------------------
-if [[ "${DETACHED_SESSION:-0}" != "1" ]]; then
+if [[ -z "${DETACHED_SESSION:-}" ]]; then
     if ! "$PYTHON" -c 'import torch, torchvision, streaming, pycocotools' >/dev/null 2>&1; then
         echo "error: $PYTHON lacks torch/torchvision/streaming/pycocotools;" \
              "pip install -r requirements.txt into the venv (or set PYTHON=...)." >&2
@@ -169,19 +184,28 @@ supervise() {  # run training, then finalize; safe to detach
 if [[ "$DETACH" == "1" ]]; then
     COMMAND+=(--no-progress)  # progress bars are pointless in a file
 
-    if [[ "${DETACHED_SESSION:-0}" == "1" ]]; then
-        # Already re-executed into our own session: this process supervises training.
-        status=0
-        supervise > /dev/null 2>&1 || status=$?
-        exit "$status"
-    fi
+    case "${DETACHED_SESSION:-}" in
+        supervisor)  # started by the shield with normal signal handling
+            status=0
+            supervise > /dev/null 2>&1 || status=$?
+            exit "$status"
+            ;;
+        shield)  # adopted by the tunnel's subreaper; SIGTERM/SIGINT ignored since exec
+            env --default-signal=TERM,INT,HUP DETACHED_SESSION=supervisor \
+                "$SCRIPT" "${LAUNCH_ARGS[@]}" < /dev/null > /dev/null 2>&1 &
+            status=0
+            wait $! || status=$?
+            exit "$status"
+            ;;
+    esac
 
     # Resolved settings are passed explicitly so the re-exec cannot disagree
     # with what is reported below.
     rm -f "$PID_FILE"  # never report a stale PID from an earlier run
-    DETACH=1 DETACHED_SESSION=1 PYTHON="$PYTHON" CACHE_DIR="$CACHE_DIR" RUNS_DIR="$RUNS_DIR" \
+    DETACH=1 DETACHED_SESSION=shield PYTHON="$PYTHON" CACHE_DIR="$CACHE_DIR" RUNS_DIR="$RUNS_DIR" \
         LOCAL_LOG_DIR="$LOCAL_LOG_DIR" NUM_GPUS="$NUM_GPUS" \
-        nohup setsid --fork "$0" "${LAUNCH_ARGS[@]}" < /dev/null > /dev/null 2>&1
+        nohup env --ignore-signal=TERM,INT setsid --fork "$SCRIPT" "${LAUNCH_ARGS[@]}" \
+        < /dev/null > /dev/null 2>&1
 
     deadline=$((SECONDS + 120))
     while [[ ! -s "$PID_FILE" && "$SECONDS" -lt "$deadline" ]]; do
@@ -196,7 +220,7 @@ if [[ "$DETACH" == "1" ]]; then
     echo "  live log:  tail -f $LOG_FILE"
     echo "  outputs:   $RUNS_DIR/$RUN_NAME/  (final log copied to $RUNS_DIR/$RUN_NAME.log)"
     echo "  stop:      kill \$(cat $PID_FILE)"
-    echo "  resume:    $0 $RUN_NAME --resume auto"
+    echo "  resume:    $SCRIPT $RUN_NAME --resume auto"
     [[ "$TERMINATE" == 1 ]] && echo "  NOTE: the cluster TERMINATES automatically after a successful run."
     exit 0
 fi

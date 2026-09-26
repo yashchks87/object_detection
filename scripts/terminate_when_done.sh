@@ -7,8 +7,10 @@
 # Usage:
 #   ./scripts/terminate_when_done.sh <run_name>
 #
-# Runs detached (nohup setsid --fork, like run_training.sh), so it survives
-# closing ssh. It waits for the run's torchrun process to exit, then for
+# Runs detached behind the same SIGTERM-ignoring shield process as
+# run_training.sh (see its header: the Databricks ssh-tunnel's subreaper
+# `pkill -P` loop killed the previous watcher), so it survives closing ssh
+# and the tunnel shutting down. It waits for the run's torchrun process to exit, then for
 # run_training.sh to record the exit status and copy the log to RUNS_DIR, and
 # terminates the cluster ONLY if the exit status is 0 AND
 # <RUNS_DIR>/<run_name>/_TRAINING_SUCCESS exists. Any failure or interruption
@@ -21,6 +23,7 @@ set -euo pipefail
 
 RUN_NAME="${1:?usage: terminate_when_done.sh <run_name>}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT="$REPO_ROOT/scripts/$(basename "${BASH_SOURCE[0]}")"
 PYTHON="${PYTHON:-$REPO_ROOT/venv/bin/python}"
 RUNS_DIR="${RUNS_DIR:-/Volumes/daai_ke_team/default/images/object_detection_datasets/coco/runs}"
 LOCAL_LOG_DIR="${LOCAL_LOG_DIR:-/local_disk0/run_logs}"
@@ -64,10 +67,18 @@ from scripts.train_frcnn import terminate_cluster; terminate_cluster()") >> "$WA
     rm -f "$WATCH_PID"
 }
 
-if [[ "${DETACHED_SESSION:-0}" == "1" ]]; then
-    watch_run
-    exit 0
-fi
+case "${DETACHED_SESSION:-}" in
+    watcher)  # started by the shield with normal signal handling (so `kill` cancels it)
+        watch_run
+        exit 0
+        ;;
+    shield)  # adopted by the tunnel's subreaper; SIGTERM/SIGINT ignored since exec
+        env --default-signal=TERM,INT,HUP DETACHED_SESSION=watcher "$SCRIPT" "$RUN_NAME" \
+            < /dev/null > /dev/null 2>&1 &
+        wait $! || true
+        exit 0
+        ;;
+esac
 
 # Pre-flight (visible to the caller).
 for var in DATABRICKS_HOST DATABRICKS_TOKEN DATABRICKS_CLUSTER_ID; do
@@ -81,9 +92,9 @@ if [[ -s "$WATCH_PID" ]] && kill -0 "$(cat "$WATCH_PID")" 2>/dev/null; then
 fi
 
 rm -f "$WATCH_PID"
-DETACHED_SESSION=1 PYTHON="$PYTHON" RUNS_DIR="$RUNS_DIR" LOCAL_LOG_DIR="$LOCAL_LOG_DIR" \
+DETACHED_SESSION=shield PYTHON="$PYTHON" RUNS_DIR="$RUNS_DIR" LOCAL_LOG_DIR="$LOCAL_LOG_DIR" \
     POLL_SECONDS="$POLL_SECONDS" SETTLE_SECONDS="$SETTLE_SECONDS" \
-    nohup setsid --fork "$0" "$RUN_NAME" < /dev/null > /dev/null 2>&1
+    nohup env --ignore-signal=TERM,INT setsid --fork "$SCRIPT" "$RUN_NAME" < /dev/null > /dev/null 2>&1
 for _ in $(seq 50); do [[ -s "$WATCH_PID" ]] && break; sleep 0.2; done
 [[ -s "$WATCH_PID" ]] || { echo "error: failed to start the watcher; see $WATCH_LOG" >&2; exit 1; }
 
