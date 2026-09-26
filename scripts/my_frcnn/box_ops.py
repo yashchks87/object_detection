@@ -29,7 +29,12 @@ def box_area(boxes: torch.Tensor) -> torch.Tensor:
     Returns:
         [N] areas.
     """
-    raise NotImplementedError('TODO(you): box_area')
+    widths = boxes[:, 2] - boxes[:, 0]
+    heights = boxes[:, 3] - boxes[:, 1]
+    widths = widths.clamp(min = 0)
+    heights = heights.clamp(min = 0)
+    return widths * heights
+    # raise NotImplementedError('TODO(you): box_area')
 
 
 def box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
@@ -42,7 +47,19 @@ def box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
         [N, M] tensor, entry (i, j) = IoU(boxes1[i], boxes2[j]) in [0, 1].
         Non-overlapping pairs give exactly 0. Shapes [0, M] / [N, 0] for empty inputs.
     """
-    raise NotImplementedError('TODO(you): box_iou')
+    # Overlap rectangle for every (i, j) pair: [N, 1] vs [1, M] broadcasts to [N, M]
+    x1 = torch.maximum(boxes1[:, None, 0], boxes2[None, :, 0])   # left   = larger x1
+    y1 = torch.maximum(boxes1[:, None, 1], boxes2[None, :, 1])   # top    = larger y1
+    x2 = torch.minimum(boxes1[:, None, 2], boxes2[None, :, 2])   # right  = smaller x2
+    y2 = torch.minimum(boxes1[:, None, 3], boxes2[None, :, 3])   # bottom = smaller y2
+ 
+    # Negative width/height means no overlap -> clamp to 0 (same idea as box_area)
+    inter = (x2 - x1).clamp(min=0) * (y2 - y1).clamp(min=0)      # [N, M]
+ 
+    area1, area2 = box_area(boxes1), box_area(boxes2)            # [N], [M]
+    union = area1[:, None] + area2[None, :] - inter              # [N, 1] + [1, M] - [N, M]
+    return inter / union
+    # raise NotImplementedError('TODO(you): box_iou')
 
 
 def clip_boxes_to_image(boxes: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
