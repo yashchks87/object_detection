@@ -3,8 +3,8 @@
 Date: 2026-09-26
 Chat transcript (condensed but complete) between Yash and Devin covering a
 training status check, COCO SOTA / TTA / training-cost questions, the decision
-to hand-write the model for learning, and the setup of a reusable "learning
-track" workflow. Part A is project-agnostic and meant to be copied into future
+to hand-write the model for learning, the setup of a reusable "learning
+track" workflow, and the first learning steps (`box_area`, `box_iou`). Part A is project-agnostic and meant to be copied into future
 projects; Part B is what happened in this repo.
 
 ---
@@ -104,6 +104,40 @@ question") with answers withheld until you have tried.
 | "explain the reference version" | Walk-through of the library code (after your tests pass) |
 | "quiz me on <topic>" | Interview-style questions |
 
+## A8. Per-function teaching loop (what worked in practice)
+
+1. **Explain in plain words first** (no implementation): what the function
+   means, a worked numeric example, where it is used in the pipeline, edge
+   cases, then 3-4 guiding questions that lead to the implementation.
+2. **Teach a new library primitive on a toy tensor**, not on the real problem
+   (e.g. `clamp`, broadcasting with `None`), so the user still has to apply it.
+3. **User attempts; AI reviews** by running the tests, listing bugs in the
+   order they will be hit, explaining why each is wrong, and not fixing it.
+4. **Full solution only after a genuine attempt and an explicit request**,
+   verified in a throwaway script first (never edit the user's file), with a
+   line-by-line "how each fix works" and a shape table. The user retypes it and
+   rewrites it from memory the next day.
+5. **Flow-level explanation on request**: where the function is called in the
+   full system, with realistic sizes, so the shapes make sense.
+
+## A9. Generic engineering lessons from this track
+
+- **Debug tensor code by printing shapes** (`pytest -k <test> -s`); every
+  intermediate should have the shape you predicted.
+- **Malformed inputs: validate at the boundaries** (data loading / target
+  preparation), **clamp where negatives are part of the math** (e.g.
+  intersections), **trust inside hot paths**. Never silently "repair" data
+  (e.g. swapping coordinates) because it hides format bugs.
+- Clamp **each factor before multiplying**: two negatives multiply to a
+  plausible-looking positive.
+- A behaviour that differs from the reference library on purpose must be
+  documented in the docstring and pinned by a test, otherwise it can silently
+  regress.
+- Prefer explicit element-wise ops (`torch.maximum/minimum`) over overloaded
+  ones (`torch.max(a, b)`), which read like reductions.
+- Keep `requirements.txt` hand-pinned to direct dependencies; `pip freeze >`
+  dumps every installed package and is hard to maintain across machines.
+
 ---
 
 # Part B: This session (object_detection repo)
@@ -187,25 +221,117 @@ question") with answers withheld until you have tried.
 - Verification: tests validated with torchvision monkeypatched in (21/21
   pass, via a throwaway script in `/tmp`, deleted); on the stubs 21/21 fail
   with `NotImplementedError` (Yash confirmed by running them).
-- Yash committed and pushed: `28be3ca Learning track is added.`
+- Yash committed and pushed: `28be3ca Learning track is added.`; this plan
+  file: `ba838f8`.
+
+## 7. `box_area`: concept, implementation, malformed boxes
+
+- Explained in plain words: xyxy, image origin top-left with y pointing down,
+  continuous coordinates (no VOC-style `+1`), degenerate boxes (area 0), and
+  where area is used (IoU union, COCO small/medium/large buckets at 32² / 96²,
+  FPN level assignment by sqrt(area), filtering).
+- Yash wrote it himself (column slicing `boxes[:, k]`, vectorised); 3/3 tests
+  passed on the first try. Review: correct; optional `boxes[..., k]` for
+  batched inputs.
+- **Correction by Devin:** the hint "malformed boxes come from `decode_boxes`"
+  was wrong; the log-space parametrisation (`w = w_a * exp(dw)`) always gives
+  positive sizes. Real sources: format mix-ups (COCO JSON is xywh, TF uses
+  yxyx, DETR cxcywh), flip bugs, annotation errors, heads that regress corners
+  directly.
+- Options compared: trust (torchvision `box_area`), clamp, validate and raise
+  (torchvision Faster R-CNN checks training targets), repair (rejected).
+- Yash asked for the PyTorch clamp: taught on a toy tensor (`t.clamp(min=0)`,
+  no in-place `clamp_`, zero gradient where clamped, `relu` equivalent); Yash
+  then added the clamp himself **per width and height before multiplying**.
+  Verified: (30,10,10,40) -> 0, (30,40,10,10) -> 0 (not a fake 600),
+  malformed boxes get zero gradient. This intentionally differs from
+  `torchvision.ops.box_area` (returns -600 / +600).
+- Open polish (not done): docstring note "malformed boxes get area 0", a
+  `test_malformed_boxes_have_zero_area` written by Yash, remove the commented
+  `raise`, PEP 8 `clamp(min=0)`.
+
+## 8. `box_iou`: concept, attempt, review, solution
+
+- Explained: IoU = overlap / union, why union (fair to both boxes), uses (RPN
+  0.7/0.3, RoI head 0.5, NMS 0.5, AP50/AP75/AP@[.5:.95]), the overlap rectangle
+  (larger x1/y1, smaller x2/y2), inclusion-exclusion union, worked test cases,
+  and why the clamp from `box_area` returns for disjoint boxes; broadcasting
+  taught on a toy tensor (`a[:, None] + b[None, :]`, `torch.maximum/minimum`).
+- Yash's attempt had the right logic (max/min edges, reusing `box_area`,
+  inclusion-exclusion) but 4 bugs, reviewed without fixing: (1) `x2` assigned
+  twice so `y2` undefined; (2) no broadcasting, [N] vs [M] compared
+  element-wise (crash if N != M, silent diagonal if N == M); (3)
+  `box_area(torch.stack(...), dim=1)`: `dim` passed to the wrong function and
+  stacked [N, M] tensors break `boxes[:, k]` indexing; (4) `area1 + area2` not
+  broadcast. Debugging tip: print shapes, run one test with `-s`.
+- Yash fixed (1), then explicitly asked for working code. Devin verified the
+  solution in a throwaway `/tmp` script (8/8 area+IoU tests) and gave it in
+  chat with per-fix explanations and a shape table
+  (`boxes1[:, None, k]` -> [N, 1], `boxes2[None, :, k]` -> [1, M]; inline
+  clamped intersection instead of `stack`; `area1[:, None] + area2[None, :]`).
+  Yash pasted it into `box_ops.py`; 5/5 IoU tests pass.
+- Interview follow-ups noted: zero-area pairs give 0/0 = NaN (epsilon fix);
+  memory of [N, M] intermediates (~80 MB per float32 tensor for 200k x 100).
+
+## 9. Flow: why `box_iou` returns [N, M]
+
+Yash asked whether the shapes differ because "1 is GT and the rest are
+proposals". Answer: it is **all** GT boxes x **all** anchors/proposals; the
+"1 vs K" case is NMS. Call sites in one training step (800x1216 image, ~7 GT):
+
+| Call | Inputs | Matrix | Used for |
+|---|---|---|---|
+| RPN matching | ~243k anchors (P2 182,400 / P3 45,600 / P4 11,400 / P5 2,850 / P6 741; 3 ratios per cell) vs GT | [243k x 7] | row max -> obj (>= 0.7) / bg (< 0.3) / ignore; column max -> every GT keeps its best anchor (low-quality matches) |
+| RPN NMS | kept proposal vs remaining | [1 x K] | remove duplicate proposals (-> ~2,000) |
+| RoI head matching | ~2,000 proposals + appended GT vs GT | [2,007 x 7] | fg (>= 0.5) with class / bg; sample 512 (25% fg) |
+| Evaluation | <= 100 detections vs GT | [100 x 7] | COCOeval hits at IoU 0.50 ... 0.95 |
+
+- torchvision's matcher calls `box_iou(gt, anchors)` (GT as rows); keep one
+  orientation in step 5 or the max is taken over the wrong dimension.
+
+## 10. Repo housekeeping during the session
+
+- Yash ran `pip freeze > requirements.txt`: the 10 hand-pinned packages were
+  replaced by 129 lines of everything installed. Devin flagged it
+  (`git checkout requirements.txt` to restore), but it was committed in
+  `c06a7db Learning continued.` together with `box_ops.py` and pushed.
+  Still open: restore the pinned version from `ba838f8`
+  (`git checkout ba838f8 -- requirements.txt`) and add any genuinely new
+  dependency by hand.
 
 ---
 
-## Current state (end of session, 2026-09-26 ~20:45 UTC)
+## Current state (end of session, 2026-09-26 ~22:56 UTC)
 
-- **Running:** `frcnn_v2_001` epoch 22/26 (batch ~5,300/7,393 at 20:46 UTC),
-  best val AP 0.3984 (epoch 21). ~4 epochs left (~4 h); the cluster auto-stops
-  after the run (`--terminate-cluster`).
-- **Learning track:** step 1 (box ops) ready for Yash to implement; nothing
-  implemented yet.
+- **Training:** `frcnn_v2_001` epoch 25/26 in progress (batch ~430/7,393 at
+  22:56 UTC, ~50 min/epoch left, i.e. ~2 epochs ≈ 1.8 h). LR 0.0002 since
+  epoch 23. Val AP: ep22 39.99, **ep23 40.39** (second LR drop +0.4),
+  ep24 40.41 (AP50 61.45, AP75 43.57, APs/m/l 23.5 / 44.3 / 52.6). Final AP
+  unverified until the run ends; the cluster then auto-stops
+  (`--terminate-cluster`).
+- **Learning track:** `box_area` (Yash, with clamp) and `box_iou` (solution
+  given after his attempt) done: **8/21 tests pass**; the 13 failures are the
+  remaining stubs (`clip_boxes_to_image`, `remove_small_boxes`,
+  `encode_boxes`, `decode_boxes`).
 
 ```bash
 cd /root/object_detection && source venv/bin/activate
-python -m pytest scripts/my_frcnn -q -p no:warnings       # learning-track tests (CPU)
-tail -f /local_disk0/run_logs/frcnn_v2_001.log            # monitor training
+python -m pytest scripts/my_frcnn -q -p no:warnings                  # all learning-track tests (CPU)
+python -m pytest scripts/my_frcnn -q -p no:warnings -k ClipAndFilter # next functions
+tail -f /local_disk0/run_logs/frcnn_v2_001.log                       # monitor training
 ```
 
-- **Uncommitted:** this plan file only.
-- **Next steps:** Yash implements `box_ops.py` until 21/21 pass, then asks for
-  review and "step 2" (NMS). After the run ends: fill in the Results section of
-  `plans/exp001-frcnn-v2-baseline.md` (final AP is unverified until then).
+- **Committed/pushed:** everything through `c06a7db`. **Uncommitted:** this
+  plan update.
+- **Next steps:**
+  1. Yash implements `clip_boxes_to_image` and `remove_small_boxes` without
+     hints (hint given: `remove_small_boxes` returns int64 indices; find the
+     PyTorch function returning positions where a boolean mask is True).
+  2. Then `encode_boxes` / `decode_boxes` (read Faster R-CNN Sec. 3.1.2
+     first), then "step 2" (NMS).
+  3. Tomorrow: rewrite `box_iou` from memory (target < 5 min).
+  4. `box_ops.py` polish from section 7; remove commented `raise` lines and
+     trailing whitespace in `box_iou`.
+  5. Restore the pinned `requirements.txt` (section 10).
+  6. After the run ends: fill in the Results section of
+     `plans/exp001-frcnn-v2-baseline.md`.
